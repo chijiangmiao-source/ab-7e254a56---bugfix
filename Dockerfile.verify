@@ -1,0 +1,19 @@
+# Image for the one-shot "verify" acceptance service: Python toolchain plus
+# Node (Debian bookworm ships Node 18, which Vite 5 supports), so the service
+# really does execute code tests, build the page and run the HTTP smoke.
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nodejs npm bash ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+# Pre-install the JS toolchain so `npm run build` during verification needs no
+# network access at run time.
+COPY web/package.json ./web/package.json
+RUN cd web && npm install --no-audit --no-fund
+COPY . .
+RUN chmod +x scripts/verify.sh
+ENV DATA_PATH=/tmp/verify.db
+ENTRYPOINT ["bash", "scripts/verify.sh"]

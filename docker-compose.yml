@@ -1,0 +1,37 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ab-upgrade-web:latest
+    environment:
+      DATA_PATH: /data/upgrade.db
+    ports:
+      # Configurable host port: HOST_PORT=9090 docker compose up
+      - "${HOST_PORT:-8080}:8000"
+    volumes:
+      - upgrade-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    restart: unless-stopped
+
+  # One-shot acceptance gate. Run with:
+  #   docker compose run --rm verify
+  # It executes pytest, builds the page, smokes power-loss recovery and the
+  # concurrent-upgrade decision against the live `web` service, then exits
+  # with a non-zero code on any failure.
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile.verify
+    image: ab-upgrade-verify:latest
+    environment:
+      DATA_PATH: /tmp/verify.db
+    profiles: ["verify"]
+
+volumes:
+  upgrade-data:
