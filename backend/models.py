@@ -153,7 +153,10 @@ class RecoveryReport:
 class Device:
     device_id: str
     slots: dict[str, Slot]
-    active_slot: str
+    # The booted slot. ``None`` means safe convergence: no slot passed the
+    # on-power content-vs-manifest re-check, so the device refuses to boot
+    # rather than guessing or rolling back to a SUPERSEDED slot.
+    active_slot: Optional[str] = None
     # Monotonic confirmation generation; bumped only by a committed confirm.
     generation: int = 0
     # Qualification for the upgrade at the *current* generation. Exactly one
@@ -161,7 +164,6 @@ class Device:
     qualified_generation: Optional[int] = None
     qualified_request: Optional[str] = None
     qualified_slot: Optional[str] = None
-    verified_digests: dict[str, str] = field(default_factory=dict)
     last_recovery: Optional[RecoveryReport] = None
     recovery_history: list[RecoveryReport] = field(default_factory=list)
     evidence: list[dict] = field(default_factory=list)
@@ -171,6 +173,8 @@ class Device:
         return self.slots[name]
 
     def inactive_slot_name(self) -> str:
+        # During safe convergence (no bootable active slot) upgrades target B;
+        # a fresh boot is only possible once recovery validates a slot anyway.
         return "B" if self.active_slot == "A" else "A"
 
     def add_evidence(self, slot: str, reason: str, detail: str) -> None:
@@ -192,7 +196,6 @@ class Device:
             "qualified_generation": self.qualified_generation,
             "qualified_request": self.qualified_request,
             "qualified_slot": self.qualified_slot,
-            "verified_digests": dict(self.verified_digests),
             "slots": {name: s.to_dict() for name, s in self.slots.items()},
             "last_recovery": self.last_recovery.to_dict()
             if self.last_recovery
@@ -207,12 +210,11 @@ class Device:
         dev = cls(
             device_id=data["device_id"],
             slots={name: Slot.from_dict(s) for name, s in data["slots"].items()},
-            active_slot=data["active_slot"],
+            active_slot=data.get("active_slot"),
             generation=data.get("generation", 0),
             qualified_generation=data.get("qualified_generation"),
             qualified_request=data.get("qualified_request"),
             qualified_slot=data.get("qualified_slot"),
-            verified_digests=dict(data.get("verified_digests", {})),
             evidence=list(data.get("evidence", [])),
             evidence_seq=data.get("evidence_seq", 0),
         )

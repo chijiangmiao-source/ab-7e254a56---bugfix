@@ -3,8 +3,10 @@
 模拟轨道载荷维护员的启动镜像升级流程。核心安全保证：
 
 - **任意时点断电都不会引导摘要不符或未确认的候选**；
+- **每次校验都实测本次写入的字节**：绝不沿用上一候选的校验结论——即使新候选声明了相同摘要；重放旧摘要、字节不同的更高版本候选一律 REJECTED；
+- **上电重开时复核每个已验证/已确认槽的持久化内容**：清单摘要与实测不符的「已确认」槽会被隔离为 REJECTED 并保留证据，设备安全收敛、拒绝引导，且**绝不回退到 SUPERSEDED 旧版本**；
 - **新版本生效后永不回退**（旧槽位标记 `SUPERSEDED`，恢复时永不选择）；
-- 恢复时**仅从「清单完整且已确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
+- 恢复时**仅从「清单完整、内容实测一致且已确认」的槽位中选定唯一活动槽位**，并展示逐槽诊断证据与裁决理由；
 - 两个页面并发提交不同候选时，**仅一个请求取得当前代次的升级资格**，另一个得到稳定 `409` 且不改写活动版本。
 
 ## 架构
@@ -14,13 +16,13 @@ backend/          FastAPI 服务
   models.py       槽位/设备/恢复报告领域模型（EMPTY→CANDIDATE→VERIFIED→CONFIRMED / REJECTED / SUPERSEDED）
   versioning.py   点分数字版本比较（候选必须严格更高）
   store.py        SQLite(WAL) 持久化：槽位清单、候选阶段、确认代次、资格令牌、诊断证据、镜像 BLOB
-  service.py      升级编排：代次资格、摘要校验、原子确认切换、断电恢复裁决
+  service.py      升级编排：代次资格、逐次实测摘要（不沿用旧结论）、原子确认切换、断电恢复复核裁决
   api.py          HTTP API + 托管 web/dist 静态页面
 web/              Vite 原生 JS 前端（中文界面，全部操作经真实 API）
-tests/            pytest（14 个用例：三种断电、损坏候选、并发裁决、防回退、重开一致）
+tests/            pytest（17 个用例：三种断电、损坏候选、重放摘要拒绝、已中毒状态重开收敛、并发裁决、防回退、重开一致）
 scripts/
   verify.sh       一次性验收：pytest → 构建页面 → 真实 uvicorn → HTTP 冒烟
-  smoke_http.py   断电恢复与并发裁决的 HTTP 冒烟（63 条断言）
+  smoke_http.py   断电恢复、并发裁决与重放摘要攻击的 HTTP 冒烟（95 条断言）
 Dockerfile        运行镜像（多阶段：Node 构建页面 + Python 运行）
 Dockerfile.verify 验收镜像（含 Node/Python，compose 中的 verify 服务）
 docker-compose.yml
@@ -34,8 +36,10 @@ docker-compose.yml
 | 摘要校验 `digest_check` | 字节写完但校验结论未提交，`actual_digest` 为空 | 诊断 `unverified_candidate`，不升级 |
 | 确认切换 `confirm_switch` | 候选仍 `VERIFIED`（未确认），代次不变 | 诊断 `unconfirmed_candidate`，引导旧版本；恢复后仍可再确认 |
 | 镜像损坏 | 清单摘要 ≠ 实测摘要，槽位 `REJECTED`，证据保留 | 诊断 `digest_mismatch`，永不引导 |
+| 重放旧摘要的更高候选 | 字节与声明摘要不符，槽位 `REJECTED`，代次/活动槽不变 | 诊断 `digest_mismatch`，继续引导原版本 |
+| 已中毒的「已确认」槽 | 内容哈希 ≠ 清单摘要，重开即隔离为 `REJECTED` | 零合格槽→安全收敛、不引导、不回退（旧槽仍 `SUPERSEDED`），证据 `digest_mismatch_on_reopen` 保留 |
 
-所有变更在 SQLite `BEGIN IMMEDIATE` 事务内完成，`COMMIT` 是唯一原子切换点；并发提交由数据库写锁串行化后再做代次资格裁决，因此冲突结果稳定。
+所有变更在 SQLite `BEGIN IMMEDIATE` 事务内完成，`COMMIT` 是唯一原子切换点；并发提交由数据库写锁串行化后再做代次资格裁决，因此冲突结果稳定。**任何校验结论都不缓存复用**：提交、确认前与上电重开三处均对当前持久化字节重新计算 SHA-256，因此一次实测结论永远无法替代另一次写入的校验。
 
 ## 快速开始（Docker Compose）
 
@@ -58,7 +62,7 @@ docker compose run --rm verify
 
 1. `pytest` 代码测试；
 2. `npm run build` 构建页面；
-3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、并发 409 裁决、切换后重开一致性进行 HTTP 冒烟；
+3. 启动**真实 uvicorn**，对三种断电恢复、损坏候选、重放旧摘要的两次升级与恢复、并发 409 裁决、切换后重开一致性进行 HTTP 冒烟；
 4. 执行完毕**自行退出**，全部通过退出码为 0，任一失败非 0。
 
 ## 本地开发（无 Docker）
