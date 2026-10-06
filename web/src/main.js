@@ -108,7 +108,8 @@ function renderDeviceBar() {
 }
 
 function statusBadge(slot) {
-  return h('span', { class: `badge ${slot.status}` }, slot.status);
+  return h('span', { class: `badge ${slot.status}` },
+    slot.quarantined ? `${slot.status} · 已隔离` : slot.status);
 }
 
 function renderSlot(slot) {
@@ -123,6 +124,7 @@ function renderSlot(slot) {
       h('div', {}, h('b', {}, '实测摘要'), h('span', { class: 'mono' }, slot.actual_digest ?? '—')),
       h('div', {}, h('b', {}, '写入进度'), slot.size == null ? '出厂预置' : `${slot.written}/${slot.size} 字节`),
       h('div', {}, h('b', {}, '确认代次'), slot.confirmed_generation ?? '—'),
+      h('div', {}, h('b', {}, '重开审计隔离'), String(!!slot.quarantined)),
       h('div', {}, h('b', {}, '清单完整'), String(slot.manifest_complete)),
       h('div', {}, h('b', {}, '可引导'), String(slot.bootable)),
     ),
@@ -206,9 +208,11 @@ function renderCandidate() {
     h('option', { value: 'digest_check' }, '故障点：摘要校验时断电'),
   );
   const corrupt = h('input', { type: 'checkbox' });
+  const reuseDigest = h('input', { type: 'checkbox' });
   const submit = h('button', {}, '提交更高版本候选');
   const confirm = h('button', { class: 'secondary' }, '确认切换（原子提交，代次 +1）');
   const confirmFault = h('input', { type: 'checkbox' });
+  const tamper = h('button', { class: 'danger' }, '故障注入：篡改已确认活动槽持久化字节（清单摘要不变）');
 
   submit.addEventListener('click', async () => {
     submit.disabled = true;
@@ -216,6 +220,14 @@ function renderCandidate() {
       const body = { version: ver.value.trim(), request_id: reqId.value.trim() || undefined };
       if (fault.value) body.fault_point = fault.value;
       if (corrupt.checked) body.corrupt = true;
+      // Attack reproduction: new version => different synthetic bytes, but the
+      // manifest claims the PREVIOUS active image's digest. Verification must
+      // measure this write and reject it instead of reusing the old verdict.
+      if (reuseDigest.checked) {
+        const prior = d.slots[d.active_slot]?.digest;
+        if (!prior) throw new Error('当前活动槽无历史摘要可沿用');
+        body.digest = prior;
+      }
       const r = await api('POST', `/devices/${encodeURIComponent(d.device_id)}/candidate`, body);
       if (r.outcome === 'power_cut') {
         flash('info', `已在故障点「${r.fault_point}」断电：${r.detail}。请点击“重新打开设备”观察恢复裁决。`);
@@ -249,6 +261,17 @@ function renderCandidate() {
     finally { confirm.disabled = false; }
   });
 
+  tamper.addEventListener('click', async () => {
+    tamper.disabled = true;
+    try {
+      const r = await api('POST',
+        `/devices/${encodeURIComponent(d.device_id)}/fault/tamper-confirmed`, { slot: d.active_slot });
+      flash('info', `已篡改槽位 ${r.target_slot} 的持久化字节但保留清单摘要，设备已断电。请点击“重新打开设备”：字节审计必须隔离该槽、拒绝引导且不回退旧版本。`);
+      await refresh(d.device_id);
+    } catch (e) { flash('err', `故障注入失败：${e.message}`); }
+    finally { tamper.disabled = false; }
+  });
+
   return h('section', { class: 'card' },
     h('h2', {}, '2. 候选升级与确认切换'),
     h('div', { class: 'row' },
@@ -256,6 +279,8 @@ function renderCandidate() {
       h('div', { class: 'field' }, h('label', {}, '请求标识 request_id'), reqId),
       h('div', { class: 'field' }, h('label', {}, '故障注入'), fault),
       h('div', { class: 'field' }, h('label', {}, '损坏镜像字节（摘要不符）'), corrupt),
+      h('div', { class: 'field' },
+        h('label', {}, '沿用前一镜像摘要（本次字节不同，必须被拒）'), reuseDigest),
       submit,
     ),
     h('h3', {}, '确认'),
@@ -264,6 +289,11 @@ function renderCandidate() {
         confirmFault, '确认切换提交前模拟断电'),
       confirm,
     ),
+    h('h3', {}, '已持久化异常状态的重开裁决'),
+    h('div', { class: 'row' }, tamper),
+    h('p', { class: 'hint' },
+      '提示：正常升级确认切换后点击「篡改已确认活动槽持久化字节」，再重新打开设备——'
+      + '重开字节审计必须将摘要不符的已确认槽隔离为 REJECTED，拒绝引导、保留证据，且不回退到 SUPERSEDED 旧版本。'),
     h('p', { class: 'hint' }, '提示：先提交候选 → 选择故障点断电 → 点击顶部“重新打开设备”，即可验证写入中断/校验中断/确认中断三种场景。'),
   );
 }

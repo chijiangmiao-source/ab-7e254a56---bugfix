@@ -1,9 +1,11 @@
 """Upgrade orchestration and power-loss recovery adjudication.
 
-The service enforces three safety rules:
+The service enforces four safety rules:
 
-1. **Write integrity** -- a slot only advances past ``CANDIDATE`` once its
-   measured digest equals the manifest digest. A mismatch leaves the slot
+1. **Write integrity** -- a slot only advances past ``CANDIDATE`` once the
+   digest *measured over the bytes actually written this time* equals the
+   manifest digest. A prior verification verdict is never reused: verification
+   is always bound to this submission's bytes. A mismatch leaves the slot
    ``REJECTED`` with append-only evidence; it can never boot.
 2. **Generation qualification** -- at any generation exactly one submitting
    request may stage a candidate. Competing submissions get a stable ``409``
@@ -12,6 +14,11 @@ The service enforces three safety rules:
    complete manifest that is ``CONFIRMED``. Unconfirmed / corrupt candidates
    are diagnosed but never booted, and a ``SUPERSEDED`` slot can never return,
    so a new effective version can never roll back.
+4. **Reopen byte audit** -- even a ``CONFIRMED`` slot is re-hashed against its
+   persisted bytes on every power-on. A mismatch quarantines the slot to
+   ``REJECTED`` (evidence retained) *before* it can be selected. If that leaves
+   no eligible slot the device stays unbootable; it never falls back to a
+   superseded version.
 """
 from __future__ import annotations
 
@@ -61,6 +68,19 @@ def sha256_hex(data: bytes) -> str:
 class UpgradeService:
     def __init__(self, store: Store):
         self.store = store
+
+    def _read_blob(self, conn, device_id: str, slot: str) -> Optional[bytes]:
+        """Read the bytes currently persisted for a slot (this transaction)."""
+        row = conn.execute(
+            "SELECT content FROM blobs WHERE device_id=? AND slot=?",
+            (device_id, slot),
+        ).fetchone()
+        return None if row is None else row["content"]
+
+    def _measure_slot(self, conn, device_id: str, slot: Slot) -> Optional[str]:
+        """Hash the bytes actually persisted for ``slot``; None if absent."""
+        content = self._read_blob(conn, device_id, slot.name)
+        return None if content is None else sha256_hex(content)
 
     # ------------------------------------------------------------------ #
     def create_device(
@@ -187,6 +207,8 @@ class UpgradeService:
             target.size = len(req.content)
             target.written = 0
             target.confirmed_generation = None
+            target.quarantined = False
+            target.quarantine_generation = None
             dev.qualified_generation = dev.generation
             dev.qualified_request = request_id
             dev.qualified_slot = target_name
@@ -241,14 +263,11 @@ class UpgradeService:
         with self.store.transaction() as conn:
             dev = self.store.load(device_id)
             t = dev.slots[target_name]
-            actual = dev.verified_digests.get(claimed)
-            if actual is None:
-                row = conn.execute(
-                    "SELECT content FROM blobs WHERE device_id=? AND slot=?",
-                    (device_id, target_name),
-                ).fetchone()
-                actual = sha256_hex(row["content"])
-                dev.verified_digests[claimed] = actual
+            # Always measure the bytes actually written for THIS candidate.
+            # A verdict from an earlier candidate must never be reused even if
+            # the manifest digest string happens to be identical: every
+            # submission's digest conclusion is bound to its own image bytes.
+            actual = self._measure_slot(conn, device_id, t)
             t.actual_digest = actual
             if actual != claimed:
                 t.status = SlotStatus.REJECTED
@@ -303,6 +322,13 @@ class UpgradeService:
 
             target_name = dev.qualified_slot or dev.inactive_slot_name()
             target = dev.slots[target_name]
+            if target.status is SlotStatus.REJECTED and target.quarantined:
+                raise ApiError(
+                    409,
+                    "slot_quarantined",
+                    f"槽位 {target_name} 已在重开字节审计中被隔离（REJECTED），"
+                    "禁止确认；需在另一槽位提交内容与摘要一致的更高版本候选",
+                )
             if target.status is not SlotStatus.VERIFIED:
                 raise ApiError(
                     409,
@@ -310,19 +336,12 @@ class UpgradeService:
                     f"槽位 {target_name} 状态为 {target.status.value}，"
                     "不存在已验证待确认的候选",
                 )
-            # Re-measure immediately before commit: never confirm on trust.
-            actual = dev.verified_digests.get(target.digest or "")
-            if actual is None:
-                row = conn.execute(
-                    "SELECT content FROM blobs WHERE device_id=? AND slot=?",
-                    (device_id, target_name),
-                ).fetchone()
-                actual = sha256_hex(row["content"]) if row else None
-                if target.digest is not None:
-                    dev.verified_digests[target.digest] = actual
+            # Re-measure the bytes currently persisted immediately before
+            # commit: never confirm on trust, and never reuse an old verdict.
+            actual = self._measure_slot(conn, device_id, target)
+            target.actual_digest = actual
             if actual != target.digest or target.digest is None:
                 target.status = SlotStatus.REJECTED
-                target.actual_digest = actual
                 dev.add_evidence(
                     target_name,
                     "digest_mismatch",
@@ -382,6 +401,59 @@ class UpgradeService:
         }
 
     # ------------------------------------------------------------------ #
+    def tamper_confirmed_slot(self, device_id: str, slot_name: str) -> dict:
+        """Bench hook: corrupt the *persisted bytes* of a CONFIRMED slot.
+
+        The manifest (claimed digest/version/generation) is left untouched,
+        reproducing a field device whose confirmed slot contents were poisoned
+        outside the normal flow -- e.g. by a build that previously accepted a
+        stale verification verdict. The device is powered off so the next
+        re-open runs the byte audit and must quarantine the slot, never boot it
+        and never fall back to a SUPERSEDED version.
+        """
+        with self.store.transaction() as conn:
+            raw = self.store.load_raw(device_id)
+            if raw is None:
+                raise ApiError(404, "not_found", f"设备 {device_id} 不存在")
+            raw.pop("_powered_on", None)
+            dev = Device.from_dict(raw)
+            if slot_name is None:
+                raise ApiError(
+                    409,
+                    "no_active_slot",
+                    "设备当前无可引导的活动槽位，无法注入已确认槽位字节损坏",
+                )
+            if slot_name not in dev.slots:
+                raise ApiError(404, "not_found", f"槽位 {slot_name} 不存在")
+            slot = dev.slots[slot_name]
+            if slot.status is not SlotStatus.CONFIRMED:
+                raise ApiError(
+                    409,
+                    "slot_not_confirmed",
+                    f"槽位 {slot_name} 状态为 {slot.status.value}，"
+                    "仅可对已确认槽位注入持久化字节损坏",
+                )
+            content = self._read_blob(conn, device_id, slot_name)
+            if not content:
+                content = b"\x00"
+            tampered = bytes([content[0] ^ 0xFF]) + content[1:]
+            self.store.write_blob(conn, device_id, slot_name, tampered)
+            self.store.set_powered(conn, device_id, False)
+            dev.add_evidence(
+                slot_name,
+                "persisted_bytes_tampered",
+                f"故障注入：已确认槽位（版本 {slot.version}，代次 "
+                f"{slot.confirmed_generation}）持久化字节被篡改但清单摘要未更新；"
+                "下次重开必须由字节审计隔离，禁止引导",
+            )
+            self.store.save(conn, dev)
+        return {
+            "outcome": "tampered",
+            "target_slot": slot_name,
+            "device": self.store.load(device_id).to_dict(),
+        }
+
+    # ------------------------------------------------------------------ #
     def power_off(self, device_id: str) -> dict:
         with self.store.transaction() as conn:
             if self.store.load_raw(device_id) is None:
@@ -397,7 +469,7 @@ class UpgradeService:
                 raise ApiError(404, "not_found", f"设备 {device_id} 不存在")
             was_off = not raw.pop("_powered_on")
             dev = Device.from_dict(raw)
-            report = self._adjudicate(dev)
+            report = self._adjudicate(conn, device_id, dev)
             report.powered_from_off = was_off
             dev.last_recovery = report
             dev.recovery_history.append(report)
@@ -412,7 +484,13 @@ class UpgradeService:
                     dev.qualified_generation = None
                     dev.qualified_request = None
                     dev.qualified_slot = None
-            self.store.set_powered(conn, device_id, True)
+                self.store.set_powered(conn, device_id, True)
+            else:
+                # No slot is allowed to boot (a confirmed slot failed the byte
+                # audit, and SUPERSEDED slots must never return): stay shut down
+                # in the maintenance state with all evidence retained.
+                dev.active_slot = None
+                self.store.set_powered(conn, device_id, False)
             self.store.save(conn, dev)
 
         return {
@@ -422,8 +500,35 @@ class UpgradeService:
         }
 
     # ------------------------------------------------------------------ #
-    def _adjudicate(self, dev: Device) -> RecoveryReport:
-        """Pick the unique bootable slot; explain every other slot's fate."""
+    def _adjudicate(self, conn, device_id: str, dev: Device) -> RecoveryReport:
+        """Pick the unique bootable slot; explain every other slot's fate.
+
+        Every currently-CONFIRMED slot is first re-measured against its
+        persisted bytes. A confirmed manifest whose flash contents no longer
+        match is quarantined *before* eligibility is evaluated, so a poisoned
+        slot inherited from older firmware can never boot again.
+        """
+        quarantined: list[Slot] = []
+        for name in sorted(dev.slots):
+            slot = dev.slots[name]
+            if slot.status is not SlotStatus.CONFIRMED or slot.quarantined:
+                continue
+            actual = self._measure_slot(conn, device_id, slot)
+            if actual is None or not slot.digest or actual != slot.digest:
+                slot.status = SlotStatus.REJECTED
+                slot.actual_digest = actual
+                slot.quarantined = True
+                slot.quarantine_generation = dev.generation
+                quarantined.append(slot)
+                dev.add_evidence(
+                    name,
+                    "confirmed_digest_mismatch",
+                    f"重开字节审计：已确认槽位（版本 {slot.version}，"
+                    f"代次 {slot.confirmed_generation}）持久化内容与清单不符："
+                    f"清单 {slot.digest}，实测 {actual}；"
+                    "已隔离为 REJECTED，禁止引导，且不回退到已取代版本",
+                )
+
         report = RecoveryReport(
             active_slot=None,
             generation=dev.generation,
@@ -439,9 +544,19 @@ class UpgradeService:
                 report.diagnoses.append(Diagnosis(name, reason, detail))
 
         report.rationale.append(
-            "恢复规则：仅从【清单完整 且 状态为 CONFIRMED】的槽位中选定唯一活动槽位"
+            "恢复规则：仅从【清单完整 且 状态为 CONFIRMED 且 重开字节审计通过】"
+            "的槽位中选定唯一活动槽位"
         )
         report.rationale.append(f"当前确认代次：{dev.generation}")
+        if quarantined:
+            report.rationale.append(
+                "字节审计："
+                + "、".join(
+                    f"{s.name} 槽（版本 {s.version}）实测摘要与清单不符，已隔离"
+                    for s in quarantined
+                )
+                + "；隔离决定仅依据本次持久化内容的实测结果"
+            )
 
         if len(eligible) == 1:
             chosen = eligible[0]
@@ -464,11 +579,21 @@ class UpgradeService:
                     "（SUPERSEDED），新版本生效后永不回退"
                 )
         elif len(eligible) == 0:
-            report.critical = (
-                "不存在任何清单完整且已确认的槽位，设备无法引导；"
-                "所有未确认/损坏候选均保留为诊断证据且未被选择"
-            )
-            report.rationale.append("裁决：零合格槽位，保持关机/维修状态")
+            supersede = [
+                n for n, s in dev.slots.items()
+                if s.status is SlotStatus.SUPERSEDED
+            ]
+            detail_lines = [
+                "不存在任何字节审计通过、清单完整且已确认的槽位，"
+                "设备保持关机/维修状态，所有不符内容均保留为可复核诊断证据且未被选择"
+            ]
+            if supersede:
+                detail_lines.append(
+                    f"防回退：{', '.join(supersede)} 槽虽可读取但已被取代，"
+                    "永不作为回退版本引导"
+                )
+            report.critical = "；".join(detail_lines)
+            report.rationale.append("裁决：零合格槽位，拒绝引导任何槽位（含已取代槽位）")
         else:
             report.critical = (
                 f"合格槽位不唯一（{eligible}），拒绝猜测性引导，等待人工裁决"
@@ -481,6 +606,17 @@ class UpgradeService:
     def _slot_verdict(slot: Slot) -> tuple[bool, str, str]:
         if slot.status is SlotStatus.CONFIRMED and slot.manifest_complete():
             return True, "eligible", "清单完整且已确认，具备引导资格"
+        if slot.quarantined or (
+            slot.status is SlotStatus.REJECTED
+            and slot.quarantine_generation is not None
+        ):
+            return (
+                False,
+                "confirmed_digest_mismatch",
+                f"已确认槽位（版本 {slot.version or ''}，代次 "
+                f"{slot.confirmed_generation}）重开字节审计失败：清单 {slot.digest}，"
+                f"实测 {slot.actual_digest}；已隔离为 REJECTED，禁止引导且不回退",
+            )
         if slot.status is SlotStatus.EMPTY:
             return False, "empty_slot", "空槽位，无镜像清单"
         if slot.status is SlotStatus.CANDIDATE:

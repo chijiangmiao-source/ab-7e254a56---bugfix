@@ -61,6 +61,10 @@ class ConfirmBody(BaseModel):
     fault_point: Optional[str] = None
 
 
+class TamperBody(BaseModel):
+    slot: Optional[str] = None  # defaults to the active (confirmed) slot
+
+
 def _decode_content(content_b64: Optional[str], version: str, corrupt: bool) -> bytes:
     if content_b64:
         try:
@@ -141,6 +145,20 @@ def confirm_switch(device_id: str, body: ConfirmBody) -> dict:
 @app.post("/api/devices/{device_id}/power-off")
 def power_off(device_id: str) -> dict:
     result = service.power_off(device_id)
+    result["device"] = _device_view(device_id)
+    return result
+
+
+@app.post("/api/devices/{device_id}/fault/tamper-confirmed")
+def tamper_confirmed(device_id: str, body: TamperBody) -> dict:
+    """Fault injection: flip persisted bytes of a CONFIRMED slot.
+
+    Leaves the manifest digest untouched, reproducing an already-affected
+    device that must be safely adjudicated (quarantined, never booted, never
+    rolled back) on the next re-open.
+    """
+    slot = body.slot or service.get_device(device_id).active_slot
+    result = service.tamper_confirmed_slot(device_id, slot)
     result["device"] = _device_view(device_id)
     return result
 

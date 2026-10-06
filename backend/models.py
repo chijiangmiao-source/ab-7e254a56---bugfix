@@ -9,13 +9,19 @@ A slot manifest goes through these stages:
 * ``VERIFIED``   -- digest verified against the manifest, awaiting confirmation
 * ``CONFIRMED``  -- operator confirmed at a unique confirmation generation;
                     only a CONFIRMED slot with a complete manifest may boot
-* ``REJECTED``   -- digest verification failed; corrupt candidate evidence kept
+* ``REJECTED``   -- digest verification failed (at submit, at the pre-confirm
+                    re-check, or at the reopen byte audit of a formerly
+                    CONFIRMED slot); corrupt candidate evidence is kept and the
+                    slot is quarantined -- it can never boot or be confirmed
 * ``SUPERSEDED`` -- a formerly CONFIRMED slot replaced by a higher generation;
                     it is retained but can never be selected again (no rollback)
 
 Power loss can interrupt any step. Recovery never trusts an in-flight write or
 an unverified/unconfirmed candidate: it selects the *unique* slot whose
-manifest is complete AND whose status is CONFIRMED.
+manifest is complete AND whose status is CONFIRMED -- and even a CONFIRMED slot
+is re-measured against its persisted bytes on every reopen, so a slot whose
+flash contents no longer match its manifest digest is quarantined before it can
+boot.
 """
 from __future__ import annotations
 
@@ -55,6 +61,10 @@ class Slot:
     size: Optional[int] = None            # None => factory-provisioned slot
     written: int = 0
     confirmed_generation: Optional[int] = None
+    # Set when a formerly CONFIRMED slot fails the reopen-time byte audit: it is
+    # quarantined to REJECTED and can never be selected or confirmed again.
+    quarantined: bool = False
+    quarantine_generation: Optional[int] = None
 
     def manifest_complete(self) -> bool:
         """True iff the write finished and a manifest digest is present.
@@ -81,6 +91,8 @@ class Slot:
             "size": self.size,
             "written": self.written,
             "confirmed_generation": self.confirmed_generation,
+            "quarantined": self.quarantined,
+            "quarantine_generation": self.quarantine_generation,
             "manifest_complete": self.manifest_complete(),
             "bootable": self.status.bootable and self.manifest_complete(),
         }
@@ -96,6 +108,8 @@ class Slot:
             size=data.get("size"),
             written=data.get("written", 0),
             confirmed_generation=data.get("confirmed_generation"),
+            quarantined=data.get("quarantined", False),
+            quarantine_generation=data.get("quarantine_generation"),
         )
 
 
@@ -161,7 +175,6 @@ class Device:
     qualified_generation: Optional[int] = None
     qualified_request: Optional[str] = None
     qualified_slot: Optional[str] = None
-    verified_digests: dict[str, str] = field(default_factory=dict)
     last_recovery: Optional[RecoveryReport] = None
     recovery_history: list[RecoveryReport] = field(default_factory=list)
     evidence: list[dict] = field(default_factory=list)
@@ -192,7 +205,6 @@ class Device:
             "qualified_generation": self.qualified_generation,
             "qualified_request": self.qualified_request,
             "qualified_slot": self.qualified_slot,
-            "verified_digests": dict(self.verified_digests),
             "slots": {name: s.to_dict() for name, s in self.slots.items()},
             "last_recovery": self.last_recovery.to_dict()
             if self.last_recovery
@@ -212,7 +224,6 @@ class Device:
             qualified_generation=data.get("qualified_generation"),
             qualified_request=data.get("qualified_request"),
             qualified_slot=data.get("qualified_slot"),
-            verified_digests=dict(data.get("verified_digests", {})),
             evidence=list(data.get("evidence", [])),
             evidence_seq=data.get("evidence_seq", 0),
         )
